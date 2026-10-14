@@ -162,6 +162,38 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Pools — launch the best of a group of accounts
+
+Group accounts (say, the ones approved for a particular kind of work) into a named pool, and `cswap run --pool` launches whichever member has the most headroom right now:
+
+```bash
+cswap pool cvp 2 3              # add accounts 2 and 3 to pool 'cvp' (an account can be in several pools)
+cswap pool cvp 3 --remove       # take one out
+cswap pool                      # list pools
+cswap run --pool cvp -- --resume
+```
+
+Setup-token members run on your normal `~/.claude` with the token passed in `CLAUDE_CODE_OAUTH_TOKEN` (no session profile; their tokens never rotate, so any number of concurrent launches can share one). Other members launch in session mode with history shared, so a resume works whichever member a later launch picks. Disabled accounts are skipped. cswap's own output goes to stderr, so `cswap run --pool NAME --` can stand in for the `claude` binary in tools that drive it over stdout.
+
+<details>
+<summary>Use a pool as a Paseo provider</summary>
+
+In `~/.paseo/config.json`, a Claude provider whose `command` is the pool launcher — Paseo appends Claude's own arguments after the `--`:
+
+```json
+"agents": { "providers": {
+  "claude-cvp": {
+    "extends": "claude",
+    "label": "Claude (CVP pool)",
+    "command": ["/home/you/.local/bin/cswap", "run", "--pool", "cvp", "--"]
+  }
+} }
+```
+
+Every agent launch (and every relaunch, e.g. after a model change) picks the pool member with the most headroom at that moment.
+
+</details>
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -182,6 +214,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap run --pool cvp            # Run the best account in a pool (see Pools)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
@@ -369,13 +402,19 @@ cswap add-token --email user@example.com     # optional label override
 ```
 
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
-(or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+(or `api-key-{slot}@token.local` for API keys). Registering makes no Anthropic API calls.
 
 **API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
 (the kind Claude Code uses after `/login` with a key) rather than an OAuth
 setup-token. It switches like any other account; since API keys have no subscription
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
+
+**Setup-token usage.** The usage endpoint never answers a setup-token, so cswap reads
+its 5h/7d usage from one minimal `claude -p` turn instead (Haiku, no tools, a
+throwaway config dir; a few hundred tokens of the account's own quota), on the same
+cadence as any other usage poll. This needs `claude` on `PATH`. Per-model windows and
+extra-usage spend are not reported this way.
 
 ## Uninstall
 

@@ -5,7 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -20,6 +24,9 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 _logger = logging.getLogger("claude-swap")
+
+# What `cswap add-token` writes for a `claude setup-token` credential.
+SETUP_TOKEN_SCOPES = ("user:inference",)
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -625,6 +632,101 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+def is_setup_token(oauth: dict | None) -> bool:
+    """A ``claude setup-token`` credential: inference scope only, no refresh token."""
+    return bool(oauth) and not oauth.get("refreshToken") and (
+        list(oauth.get("scopes") or []) == list(SETUP_TOKEN_SCOPES)
+    )
+
+
+# One real Claude Code turn: the cheapest model, no tools, no settings/MCP/
+# history, a one-line system prompt. ~400 input tokens, a few output tokens.
+_PROBE_ARGS = (
+    "-p", ".", "--output-format", "stream-json", "--verbose",
+    "--model", "haiku", "--max-turns", "1", "--tools", "",
+    "--system-prompt", "Reply with one word.", "--setting-sources", "",
+    "--strict-mcp-config", "--no-session-persistence",
+)
+_PROBE_TIMEOUT_S = 60
+
+
+def parse_rate_limit_events(stdout: str) -> tuple[dict | None, int | None]:
+    """Raw usage-API-shaped data from the last ``rate_limit_event`` in a
+    ``claude -p --output-format stream-json`` transcript, plus the last
+    ``api_retry`` HTTP status (how a revoked token shows up) for errors."""
+    data, status = None, None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("subtype") == "api_retry" and isinstance(event.get("error_status"), int):
+            status = event["error_status"]
+        info = event.get("rate_limit_info") if event.get("type") == "rate_limit_event" else None
+        windows = info.get("unifiedWindows") if isinstance(info, dict) else None
+        if not isinstance(windows, dict):
+            continue
+        parsed = {}
+        for key in ("five_hour", "seven_day"):
+            w = windows.get(key)
+            if not isinstance(w, dict) or not isinstance(w.get("utilization"), (int, float)):
+                continue
+            entry: dict = {"utilization": round(float(w["utilization"]) * 100, 1)}
+            if isinstance(w.get("resetsAt"), (int, float)):
+                entry["resets_at"] = datetime.fromtimestamp(
+                    w["resetsAt"], tz=timezone.utc
+                ).isoformat()
+            parsed[key] = entry
+        if parsed:
+            data = parsed
+    return data, status
+
+
+def probe_setup_token_usage(access_token: str) -> UsageOutcome:
+    """Usage for a setup-token, read the way Claude Code itself sees it.
+
+    ``/api/oauth/usage`` never answers an inference-only token (403/429, and
+    the failures count against the host's endpoint budget). Every inference
+    response carries the unified 5h/7d windows, which Claude Code surfaces as
+    a ``rate_limit_event``, so run one minimal ``claude -p`` turn with the
+    token and read that. Real Claude Code traffic, not a hand-built API call;
+    an exhausted account still reports (status ``rejected``) at no cost. The
+    turn runs in a throwaway config dir so nothing touches the user's
+    profile or history. No per-model windows or spend come back this way.
+    """
+    claude = shutil.which("claude")
+    if not claude:
+        return UsageOutcome(None, error="no-claude-binary")
+    # Drop every auth/provider override (ANTHROPIC_BASE_URL would send the
+    # probe to a proxy) and any parent-session marker.
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith(("ANTHROPIC_", "CLAUDE_")) and k != "CLAUDECODE"
+    }
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
+    env["MAX_THINKING_TOKENS"] = "0"
+    with tempfile.TemporaryDirectory(prefix="cswap-usage-probe-") as tmp:
+        env["CLAUDE_CONFIG_DIR"] = tmp
+        try:
+            proc = subprocess.run(
+                [claude, *_PROBE_ARGS], cwd=tmp, env=env, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return UsageOutcome(None, error="probe-timeout")
+        except OSError as e:
+            _logger.warning("Usage probe failed to start claude: %r", e)
+            return UsageOutcome(None, error="no-claude-binary")
+    data, status = parse_rate_limit_events(proc.stdout)
+    if data is not None:
+        return UsageOutcome(build_usage_result(data))
+    kind = f"http-{status}" if status else "no-rate-limit-event"
+    _logger.warning("Usage probe got no rate-limit event: %s (exit %s)", kind, proc.returncode)
+    return UsageOutcome(None, error=kind)
+
+
 # Refresh failures that will not resolve by retrying THIS pass, so the caller
 # must not fall through to the usage endpoint with the known-expired token.
 # `consume-busy` belongs here for a reason the other two make obvious only in
@@ -658,6 +760,8 @@ def try_fetch_usage_for_account(
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return UsageOutcome(None, error="no-access-token")
+    if is_setup_token(oauth):
+        return probe_setup_token_usage(access_token)
 
     working_credentials = credentials
 

@@ -48,7 +48,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -644,6 +644,46 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def run_pool(self, pool: str, claude_args: list[str]) -> NoReturn:
+        """Launch Claude Code as the pool member with the most headroom.
+
+        A setup-token member needs no session profile: its token never
+        rotates, so it rides in ``CLAUDE_CODE_OAUTH_TOKEN`` on the normal
+        config dir, and any number of concurrent launches can share it and
+        one history. Other members launch in session mode with history
+        shared, so a resume works whichever member a later launch picks.
+        Status lines go to stderr: wrappers (Paseo, the Agent SDK) speak to
+        claude over stdout.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+        # Wrappers health-check their "claude" with `--version` / `auth
+        # status` on a short timeout; those need no usage-ranked pick.
+        quick = claude_args[:1] in (["--version"], ["auth"])
+        account_num = self.switcher.pick_pool_account(pool, rank=not quick)
+        _, email, _ = self.switcher.resolve_account(account_num)
+        creds = self.switcher.read_account_credentials(account_num, email)
+        token_oauth = oauth.extract_oauth_data(creds) if creds else None
+        if oauth.is_setup_token(token_oauth):
+            print(
+                f"{accent('Launching')} Account-{account_num} ({email}) "
+                f"{muted(f'[pool {pool}]')}",
+                file=sys.stderr,
+            )
+            env = {
+                k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
+            }
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = token_oauth["accessToken"]
+            self._exec(claude_bin, claude_args, env=env)
+        self.run(
+            account_num,
+            claude_args,
+            share_history=self.switcher.platform != Platform.WINDOWS,
+        )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

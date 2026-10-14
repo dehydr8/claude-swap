@@ -103,7 +103,7 @@ KEYRING_SERVICE = "claude-code"
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
-SETUP_TOKEN_SCOPES = ("user:inference",)
+SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -194,6 +194,10 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    # Setup-token usage comes from a one-turn `claude -p` probe.
+    "no-claude-binary": "setup-token usage needs `claude` on PATH",
+    "probe-timeout": "setup-token usage probe timed out — retries next pass",
+    "no-rate-limit-event": "setup-token usage probe returned no usage — retries next pass",
 }
 
 SENTINEL_NOTES = {
@@ -1049,6 +1053,75 @@ class ClaudeAccountSwitcher:
             if acc.get("alias")
         ]
         return sorted(rows, key=lambda r: int(r[0]))
+
+    def set_pool_membership(
+        self, pool: str, identifiers: list[str], member: bool
+    ) -> list[str]:
+        """Add (``member=True``) or remove accounts from a named pool.
+
+        Membership is a ``pools`` list on each account record, so it moves
+        with the account (``move``/``swap``) and vanishes with it on remove.
+        Returns the affected account numbers.
+        """
+        self._refuse_session_shell()
+        try:
+            name = normalize_alias(pool)
+        except ValueError as e:
+            raise ValidationError(str(e).replace("alias", "pool name")) from e
+        nums = [self.resolve_account(i)[0] for i in identifiers]
+        data = self._get_sequence_data() or {}
+        for num in nums:
+            record = data["accounts"][num]
+            pools = [p for p in record.get("pools", []) if p != name]
+            if member:
+                pools.append(name)
+            if pools:
+                record["pools"] = pools
+            else:
+                record.pop("pools", None)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return nums
+
+    def pools(self) -> dict[str, list[str]]:
+        """Pool name → member account numbers, in sequence order."""
+        data = self._get_sequence_data_migrated() or {}
+        out: dict[str, list[str]] = {}
+        for num in data.get("sequence", []):
+            record = data.get("accounts", {}).get(str(num)) or {}
+            for name in record.get("pools", []):
+                out.setdefault(name, []).append(str(num))
+        return dict(sorted(out.items()))
+
+    def pick_pool_account(self, pool: str, rank: bool = True) -> str:
+        """The pool member with the most headroom right now (``rank=False``:
+        the first usable member, without touching usage).
+
+        Considers enabled, switchable members only. Members whose usage is
+        unknown rank below every measured one; ties keep sequence order. An
+        exhausted pool still returns its best member — Claude Code reports the
+        limit itself, which beats refusing to launch.
+        """
+        name = pool.strip().lower()
+        members = self.pools().get(name)
+        if not members:
+            raise AccountNotFoundError(f"No pool named '{name}' (see `cswap pool`)")
+        data = self._get_sequence_data() or {}
+        candidates = [
+            n for n in members
+            if self._account_is_switchable(n) and not self._disabled_from_data(data, n)
+        ]
+        if not candidates:
+            raise ConfigError(f"Pool '{name}' has no enabled, usable accounts")
+        if not rank:
+            return candidates[0]
+        _threshold, models = self._poll_policy_inputs()
+        usage = self._usage_by_account()
+        headroom = {n: oauth.account_headroom(usage.get(n), models) for n in candidates}
+        return max(
+            candidates,
+            key=lambda n: (headroom[n] is not None, headroom[n] or 0.0),
+        )
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).

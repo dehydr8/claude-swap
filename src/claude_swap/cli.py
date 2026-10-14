@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -135,7 +136,15 @@ Examples:
   cswap run 2 --share-history
   cswap run 2 --require-session
   cswap run 2 -- --resume
+  cswap run --pool cvp -- --resume   # most-headroom member of pool 'cvp'
         """,
+    )
+    parser.add_argument(
+        "--pool",
+        metavar="NAME",
+        help="Launch the member of this pool (see `cswap pool`) with the most "
+        "headroom. cswap's own output goes to stderr, so this can stand in "
+        "for the claude binary in wrappers.",
     )
     parser.add_argument(
         "account",
@@ -188,6 +197,13 @@ Examples:
         from claude_swap.session import SessionManager
 
         manager = SessionManager(switcher)
+
+        if args.pool is not None:
+            if args.account is not None:
+                parser.error("pass either NUM|EMAIL or --pool, not both")
+            with contextlib.redirect_stdout(sys.stderr):
+                manager.run_pool(args.pool, tail)
+            return  # only reachable in tests
 
         if args.account is not None:
             manager.run(
@@ -573,6 +589,61 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _pool_command(argv: list[str]) -> None:
+    """Handle `cswap pool [NAME [NUM|EMAIL ...] [--remove]]`."""
+    parser = argparse.ArgumentParser(
+        prog="cswap pool",
+        description=(
+            "Group accounts into named pools. `cswap run --pool NAME` launches "
+            "the member with the most headroom. An account can be in several "
+            "pools. With no arguments, lists pools."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pool cvp 2 3                  # add accounts 2 and 3 to pool 'cvp'
+  cswap pool cvp 3 --remove           # take account 3 out
+  cswap pool                          # list pools
+  cswap run --pool cvp                # launch the best member
+        """,
+    )
+    parser.add_argument("name", nargs="?", metavar="NAME", help="Pool name")
+    parser.add_argument(
+        "accounts", nargs="*", metavar="NUM|EMAIL", help="Accounts to add or remove"
+    )
+    parser.add_argument("--remove", action="store_true", help="Remove the accounts")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.name is not None and not args.accounts:
+        parser.error("at least one NUM|EMAIL is required")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.name is None:
+            pools = switcher.pools()
+            if not pools:
+                print(dimmed("No pools yet"))
+                return
+            accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+            for name, nums in pools.items():
+                print(bolded(f"{name}:"))
+                for num in nums:
+                    print(f"  {num}: {muted(accounts[num].get('email', ''))}")
+            return
+
+        nums = switcher.set_pool_membership(
+            args.name, args.accounts, member=not args.remove
+        )
+        verb = "Removed" if args.remove else "Added"
+        prep = "from" if args.remove else "to"
+        print(f"{accent(verb)} Account {', '.join(nums)} {prep} pool '{args.name.lower()}'")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
 
 
 def _auto_command(argv: list[str]) -> None:
@@ -1010,6 +1081,9 @@ def main() -> None:
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
         return
+    if argv and argv[0] == "pool":
+        _pool_command(argv[1:])
+        return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
@@ -1049,6 +1123,9 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s run --pool <name> [-- ...] run the best account in a pool
+  %(prog)s pool <name> <num|email>... add accounts to a pool (--remove)
+  %(prog)s pool                       list pools
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

@@ -573,6 +573,19 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_usage_probe(monkeypatch):
+    """Safety net: no test may spend a real ``claude -p`` turn on a
+    setup-token usage probe. Tests of the probe itself call the function
+    imported before this patch and stub ``subprocess.run`` beneath it."""
+    from claude_swap.oauth import UsageOutcome
+
+    monkeypatch.setattr(
+        "claude_swap.oauth.probe_setup_token_usage",
+        lambda token: UsageOutcome(None, error="no-claude-binary"),
+    )
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
