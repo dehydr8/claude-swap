@@ -1097,7 +1097,10 @@ class ClaudeAccountSwitcher:
         """The pool member with the most headroom right now (``rank=False``:
         the first usable member, without touching usage).
 
-        Considers enabled, switchable members only. Members whose usage is
+        Disabled members are still picked: ``disable`` keeps an account off
+        the default login's rotation, and a pool launch never touches the
+        default login — so ``cswap disable`` reserves a member for its pools.
+        To rest a member, remove it from the pool. Members whose usage is
         unknown rank below every measured one; ties keep sequence order. An
         exhausted pool still returns its best member — Claude Code reports the
         limit itself, which beats refusing to launch.
@@ -1106,13 +1109,9 @@ class ClaudeAccountSwitcher:
         members = self.pools().get(name)
         if not members:
             raise AccountNotFoundError(f"No pool named '{name}' (see `cswap pool`)")
-        data = self._get_sequence_data() or {}
-        candidates = [
-            n for n in members
-            if self._account_is_switchable(n) and not self._disabled_from_data(data, n)
-        ]
+        candidates = [n for n in members if self._account_is_switchable(n)]
         if not candidates:
-            raise ConfigError(f"Pool '{name}' has no enabled, usable accounts")
+            raise ConfigError(f"Pool '{name}' has no usable accounts")
         if not rank:
             return candidates[0]
         _threshold, models = self._poll_policy_inputs()

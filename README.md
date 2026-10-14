@@ -173,7 +173,7 @@ cswap pool                      # list pools
 cswap run --pool cvp -- --resume
 ```
 
-Setup-token members run on your normal `~/.claude` with the token passed in `CLAUDE_CODE_OAUTH_TOKEN` (no session profile; their tokens never rotate, so any number of concurrent launches can share one). Other members launch in session mode with history shared, so a resume works whichever member a later launch picks. Disabled accounts are skipped. cswap's own output goes to stderr, so `cswap run --pool NAME --` can stand in for the `claude` binary in tools that drive it over stdout.
+Setup-token members run on your normal `~/.claude` with the token passed in `CLAUDE_CODE_OAUTH_TOKEN` (no session profile; their tokens never rotate, so any number of concurrent launches can share one). Other members launch in session mode with history shared, so a resume works whichever member a later launch picks. To keep pool members for pool launches only, `cswap disable` them: disabled accounts stay out of `cswap auto` and default-login rotation but are still picked by `--pool` (to rest one, remove it from the pool). cswap's own output goes to stderr, so `cswap run --pool NAME --` can stand in for the `claude` binary in tools that drive it over stdout.
 
 <details>
 <summary>Use a pool as a Paseo provider</summary>

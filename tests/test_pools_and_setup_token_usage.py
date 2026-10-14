@@ -116,9 +116,9 @@ class TestPools:
             assert s.pick_pool_account("cvp") == "3"
         with patch.object(s, "_usage_by_account", return_value={"1": u(90), "2": None, "3": None}):
             assert s.pick_pool_account("cvp") == "1"  # unknown ranks below measured
-        s.set_account_disabled("1", True)
-        with patch.object(s, "_usage_by_account", return_value={}):
-            assert s.pick_pool_account("cvp") == "2"  # disabled skipped, then order
+        s.set_account_disabled("1", True)  # reserved for pools, not skipped
+        with patch.object(s, "_usage_by_account", return_value={"1": u(10), "3": u(20)}):
+            assert s.pick_pool_account("cvp") == "1"
         with pytest.raises(AccountNotFoundError):
             s.pick_pool_account("nope")
 
