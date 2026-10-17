@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from claude_swap.exceptions import ValidationError
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -27,6 +31,14 @@ _logger = logging.getLogger("claude-swap")
 
 # What `cswap add-token` writes for a `claude setup-token` credential.
 SETUP_TOKEN_SCOPES = ("user:inference",)
+
+# `cswap setup-token` runs the browser sign-in `claude setup-token` does (as of
+# Claude Code 2.1.302) but also asks for user:profile, so /api/oauth/usage
+# answers the token directly and no `claude -p` probe is needed.
+OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+OAUTH_MANUAL_REDIRECT_URL = "https://platform.claude.com/oauth/code/callback"
+USAGE_TOKEN_SCOPES = ("user:inference", "user:profile")
+LONG_LIVED_TOKEN_EXPIRES_IN = 31536000  # one year, the lifetime setup-token asks for
 
 
 def extract_access_token(credentials: str) -> str | None:
@@ -777,6 +789,72 @@ def probe_setup_token_usage(access_token: str) -> UsageOutcome:
     kind = f"http-{status}" if status else "no-rate-limit-event"
     _logger.warning("Usage probe got no rate-limit event: %s (exit %s)", kind, proc.returncode)
     return UsageOutcome(None, error=kind)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def new_pkce_pair() -> tuple[str, str]:
+    """A PKCE ``(code_verifier, S256 code_challenge)`` pair."""
+    verifier = _b64url(secrets.token_bytes(32))
+    return verifier, _b64url(hashlib.sha256(verifier.encode()).digest())
+
+
+def new_oauth_state() -> str:
+    return _b64url(secrets.token_bytes(32))
+
+
+def build_authorize_url(scopes: Sequence[str], code_challenge: str, state: str) -> str:
+    """The manual-paste authorize URL, parameter for parameter what Claude Code
+    builds for `claude setup-token`, except for the requested scopes."""
+    return OAUTH_AUTHORIZE_URL + "?" + urllib.parse.urlencode({
+        "code": "true",
+        "client_id": OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": OAUTH_MANUAL_REDIRECT_URL,
+        "scope": " ".join(scopes),
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
+
+
+def exchange_authorization_code(
+    code: str, code_verifier: str, state: str, expires_in: int
+) -> dict:
+    """Trade a pasted authorization code for tokens; the raw token response.
+
+    ``expires_in`` asks for the token's lifetime, as `claude setup-token` does;
+    the response says what the server actually granted. Raises
+    ``ValidationError`` carrying the server's error when the exchange fails.
+    """
+    body = json.dumps({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": OAUTH_MANUAL_REDIRECT_URL,
+        "client_id": OAUTH_CLIENT_ID,
+        "code_verifier": code_verifier,
+        "state": state,
+        "expires_in": expires_in,
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "claude-swap/1.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:500] if hasattr(e, "read") else ""
+        raise ValidationError(f"Token exchange failed (HTTP {e.code}): {detail}") from e
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ValidationError(f"Token exchange failed: {e}") from e
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise ValidationError("Token exchange returned no access token")
+    return data
 
 
 # Refresh failures that will not resolve by retrying THIS pass, so the caller

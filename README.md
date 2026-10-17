@@ -232,6 +232,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap run --pool cvp            # Run a pool, kept on a member with headroom (see Pools)
+cswap setup-token               # Mint a long-lived token that reports usage
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
@@ -434,6 +435,24 @@ account's own quota), on the same cadence as any other usage poll. This needs `c
 on `PATH`. Per-model windows and extra-usage spend are not reported this way. The token
 string does not say its scopes, so cswap asks the profile endpoint once per token: one
 that also has `user:profile` gets the normal usage endpoint instead.
+
+**Tokens that report usage.** `cswap setup-token` runs the same browser sign-in as
+`claude setup-token` but also asks for the `user:profile` scope, which the usage
+endpoint requires. It prints the token to stdout (everything else goes to stderr),
+along with the scopes and lifetime the server granted and whether the usage endpoint
+answers the token. Register it like any setup token — cswap finds its `user:profile`
+scope on the first usage fetch — including in pools and `CLAUDE_POOL_TOKENS_*` lists:
+
+```bash
+cswap setup-token | cswap add-token -
+cswap setup-token --scopes "user:inference user:profile" --expires-in 31536000
+```
+
+`--scopes` defaults to `user:inference user:profile` and `--expires-in` to one year,
+the lifetime `claude setup-token` asks for. The sign-in uses Claude Code's public
+OAuth client with a scope combination `claude setup-token` doesn't request; whether
+the server grants it, and for how long, is up to Anthropic, so check the printed
+lifetime.
 
 ## Uninstall
 

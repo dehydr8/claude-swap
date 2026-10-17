@@ -1,18 +1,21 @@
 """Pools (`cswap pool`, `cswap run --pool`, `cswap auto --pool`, env-defined
-pools, the `claude` shim) and setup-token usage probing."""
+pools, the `claude` shim), setup-token usage probing, and `cswap setup-token`."""
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth, pools
+from claude_swap import cli, oauth, pools
 from claude_swap.exceptions import AccountNotFoundError, ValidationError
 from claude_swap.models import Platform
 # The real ones, imported before conftest's autouse stubs replace them.
@@ -321,3 +324,82 @@ class TestShim:
             cli.main()
         run.assert_called_once_with(["--pool", "--", "--resume"])
         assert os.environ["PATH"] == str(real)
+
+
+class TestSetupTokenSignIn:
+    def test_authorize_url_matches_claude_setup_token_except_scope(self):
+        # Parameters captured from `claude setup-token` (Claude Code 2.1.302).
+        url = oauth.build_authorize_url(["user:inference", "user:profile"], "CH", "ST")
+        base, query = url.split("?")
+        assert base == "https://claude.com/cai/oauth/authorize"
+        assert urllib.parse.parse_qsl(query) == [
+            ("code", "true"),
+            ("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+            ("response_type", "code"),
+            ("redirect_uri", "https://platform.claude.com/oauth/code/callback"),
+            ("scope", "user:inference user:profile"),
+            ("code_challenge", "CH"),
+            ("code_challenge_method", "S256"),
+            ("state", "ST"),
+        ]
+
+    def test_exchange_posts_code_and_lifetime(self):
+        resp = io.BytesIO(json.dumps({"access_token": "sk-ant-oat01-new", "expires_in": 9}).encode())
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp) as urlopen:
+            data = oauth.exchange_authorization_code("CODE", "VER", "ST", 31536000)
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://platform.claude.com/v1/oauth/token"
+        assert json.loads(req.data) == {
+            "grant_type": "authorization_code", "code": "CODE",
+            "redirect_uri": "https://platform.claude.com/oauth/code/callback",
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            "code_verifier": "VER", "state": "ST", "expires_in": 31536000,
+        }
+        assert data["access_token"] == "sk-ant-oat01-new"
+
+    def test_exchange_failure_carries_server_error(self):
+        err = urllib.error.HTTPError(
+            "u", 400, "Bad Request", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             pytest.raises(ValidationError, match="HTTP 400.*invalid_grant"):
+            oauth.exchange_authorization_code("CODE", "VER", "ST", 60)
+
+
+class TestSetupTokenCommand:
+    def _run(self, monkeypatch, capsys, pasted: str, *, usage=None):
+        monkeypatch.setattr(oauth, "new_oauth_state", lambda: "ST")
+        monkeypatch.setattr(sys, "stdin", io.StringIO(pasted + "\n"))
+        monkeypatch.setattr(sys, "argv", ["cswap", "setup-token"])
+        exchange = patch.object(oauth, "exchange_authorization_code", return_value={
+            "access_token": "sk-ant-oat01-new", "expires_in": 31536000,
+            "scope": "user:inference user:profile",
+        })
+        usage_call = patch.object(oauth, "request_usage_data", side_effect=usage or (
+            lambda token: {"five_hour": {"utilization": 4.0}, "seven_day": {"utilization": 9.0}}))
+        with exchange as ex, usage_call, patch("claude_swap.update_check.check_for_update", return_value=None):
+            try:
+                cli.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        out, err = capsys.readouterr()
+        return code, out, err, ex
+
+    def test_prints_only_the_token_on_stdout(self, monkeypatch, capsys):
+        code, out, err, ex = self._run(monkeypatch, capsys, "CODE#ST")
+        assert code == 0 and out == "sk-ant-oat01-new\n"
+        assert "scope=user%3Ainference+user%3Aprofile" in err
+        assert "Lifetime: 365.0 days" in err
+        assert "Usage endpoint: answers (five_hour 4%, seven_day 9%)" in err
+        assert ex.call_args.args[0] == "CODE" and ex.call_args.args[2:] == ("ST", 31536000)
+
+    def test_code_for_another_sign_in_is_rejected_before_exchange(self, monkeypatch, capsys):
+        code, out, err, ex = self._run(monkeypatch, capsys, "CODE#OTHER")
+        assert code == 1 and out == ""
+        ex.assert_not_called()
+
+    def test_refused_usage_still_prints_token_and_says_so(self, monkeypatch, capsys):
+        refused = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
+        code, out, err, _ = self._run(monkeypatch, capsys, "CODE#ST", usage=refused)
+        assert code == 0 and out == "sk-ant-oat01-new\n"
+        assert "refused (HTTP 403)" in err

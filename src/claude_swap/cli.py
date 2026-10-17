@@ -8,8 +8,9 @@ import json
 import math
 import os
 import sys
+import urllib.error
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, oauth, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
@@ -687,6 +688,93 @@ Examples:
         sys.exit(1)
 
 
+def _setup_token_command(argv: list[str]) -> None:
+    """Handle `cswap setup-token [--scopes SCOPES] [--expires-in SECONDS]`."""
+    default_scopes = " ".join(oauth.USAGE_TOKEN_SCOPES)
+    parser = argparse.ArgumentParser(
+        prog="cswap setup-token",
+        description=(
+            "Mint a long-lived OAuth token like `claude setup-token`, but with "
+            "user:profile too, so cswap reads its usage from the usage endpoint "
+            "instead of a `claude -p` probe. Sign in with the account in a "
+            "browser and paste back the code; the token is printed to stdout, "
+            "everything else to stderr."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap setup-token                               # print a token
+  TOKEN=$(cswap setup-token)
+  cswap setup-token | cswap add-token -
+        """,
+    )
+    parser.add_argument(
+        "--scopes",
+        default=default_scopes,
+        metavar="SCOPES",
+        help=f"Space-separated scopes to request (default: {default_scopes})",
+    )
+    parser.add_argument(
+        "--expires-in",
+        type=int,
+        default=oauth.LONG_LIVED_TOKEN_EXPIRES_IN,
+        metavar="SECONDS",
+        help="Requested token lifetime (default: one year, like claude setup-token)",
+    )
+    args = parser.parse_args(argv)
+    scopes = args.scopes.split()
+    if not scopes:
+        parser.error("--scopes cannot be empty")
+    if args.expires_in <= 0:
+        parser.error("--expires-in must be a positive number of seconds")
+
+    verifier, challenge = oauth.new_pkce_pair()
+    state = oauth.new_oauth_state()
+    url = oauth.build_authorize_url(scopes, challenge, state)
+    print(
+        "Open this URL, sign in with the account to mint a token for, and approve:"
+        f"\n\n{url}\n",
+        file=sys.stderr,
+    )
+    print("Paste the code shown after approval (code#state): ",
+          end="", file=sys.stderr, flush=True)
+    code, _, pasted_state = sys.stdin.readline().strip().partition("#")
+    if not code or pasted_state != state:
+        error("Error: that is not the code for this sign-in (expected code#state)")
+        sys.exit(1)
+
+    try:
+        data = oauth.exchange_authorization_code(code, verifier, state, args.expires_in)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    token = data["access_token"]
+
+    granted = data.get("scope") or args.scopes
+    expires = data.get("expires_in")
+    lifetime = (
+        f"{expires / 86400:.1f} days" if isinstance(expires, (int, float)) else "not reported"
+    )
+    try:
+        usage = oauth.build_usage_result(oauth.request_usage_data(token)) or {}
+        windows = [f"{k} {usage[k]['pct']:g}%" for k in ("five_hour", "seven_day")
+                   if isinstance(usage.get(k), dict) and "pct" in usage[k]]
+        usage_note = "answers" + (f" ({', '.join(windows)})" if windows else "")
+    except urllib.error.HTTPError as e:
+        usage_note = f"refused (HTTP {e.code}); cswap will need the claude -p probe"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        usage_note = f"not checked ({e})"
+    print(
+        f"\nGranted scopes: {granted}\n"
+        f"Lifetime: {lifetime}\n"
+        f"Refresh token returned: {'yes' if data.get('refresh_token') else 'no'}\n"
+        f"Usage endpoint: {usage_note}\n"
+        "Register it with: cswap add-token - (cswap checks its scopes on first use)\n",
+        file=sys.stderr,
+    )
+    print(token)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1200,6 +1288,9 @@ def main() -> None:
     if argv and argv[0] == "pool":
         _pool_command(argv[1:])
         return
+    if argv and argv[0] == "setup-token":
+        _setup_token_command(argv[1:])
+        return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
@@ -1234,6 +1325,7 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s setup-token                mint a long-lived token that reports usage
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
@@ -1241,7 +1333,6 @@ Commands:
   %(prog)s run                        run the current dir's mapped account
   %(prog)s run --pool [name] [-- ...] run a pool, kept on a member with headroom
   %(prog)s pool <name> <num|email>... add accounts to a pool (--remove)
-  %(prog)s pool <name> --switch       move a pool's sessions to its best member
   %(prog)s pool                       list pools
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
