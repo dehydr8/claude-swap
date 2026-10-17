@@ -639,6 +639,58 @@ def is_setup_token(oauth: dict | None) -> bool:
     )
 
 
+# token digest -> bool: whether a token registered as inference-only (every
+# `cswap add-token` credential: the token string does not say its scopes)
+# also has `user:profile`, so the usage endpoint answers it. A token's scopes
+# are fixed when it is issued, so each is asked once.
+TOKEN_SCOPES_FILE = "token_scopes.json"
+
+
+def token_has_profile_scope(access_token: str) -> bool | None:
+    """Ask ``/api/oauth/profile``: it answers a ``user:profile`` token, and
+    refuses an inference-only one with a 403 (``oauth_scope_insufficient``).
+    None when the answer says neither (network, 401, 429, ...)."""
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/profile",
+        headers={"Authorization": f"Bearer {access_token}", "User-Agent": "claude-swap/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except urllib.error.HTTPError as e:
+        return False if e.code == 403 else None
+    except Exception as e:  # noqa: BLE001 - undecided; asked again next time
+        _logger.debug("Token scope check failed: %r", e)
+        return None
+
+
+def setup_token_has_profile_scope(access_token: str) -> bool:
+    """Cached :func:`token_has_profile_scope`; an undecided answer is False
+    for this fetch (the probe reads any token) and is asked again next time."""
+    from claude_swap.paths import get_backup_root
+    from claude_swap.settings import atomic_write_json
+
+    path = get_backup_root() / TOKEN_SCOPES_FILE
+    key = hashlib.sha256(access_token.encode()).hexdigest()[:32]
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    if isinstance(cache.get(key), bool):
+        return cache[key]
+    answer = token_has_profile_scope(access_token)
+    if answer is None:
+        return False
+    cache[key] = answer
+    try:
+        atomic_write_json(path, cache)
+    except OSError as e:
+        _logger.debug("Could not cache token scope: %r", e)
+    return answer
+
+
 # One real Claude Code turn: the cheapest model, no tools, no settings/MCP/
 # history, a one-line system prompt. ~400 input tokens, a few output tokens.
 _PROBE_ARGS = (
@@ -760,7 +812,7 @@ def try_fetch_usage_for_account(
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
         return UsageOutcome(None, error="no-access-token")
-    if is_setup_token(oauth):
+    if is_setup_token(oauth) and not setup_token_has_profile_scope(access_token):
         return probe_setup_token_usage(access_token)
 
     working_credentials = credentials

@@ -584,6 +584,10 @@ def block_real_usage_probe(monkeypatch):
         "claude_swap.oauth.probe_setup_token_usage",
         lambda token: UsageOutcome(None, error="no-claude-binary"),
     )
+    # ...nor ask the profile endpoint for a setup-token's scopes.
+    monkeypatch.setattr(
+        "claude_swap.oauth.setup_token_has_profile_scope", lambda token: False
+    )
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -141,9 +141,13 @@ Examples:
     )
     parser.add_argument(
         "--pool",
+        nargs="?",
+        const="",
         metavar="NAME",
-        help="Launch the member of this pool (see `cswap pool`) with the most "
-        "headroom. cswap's own output goes to stderr, so this can stand in "
+        help="Launch a member of this pool (see `cswap pool`; default "
+        "$CLAUDE_POOL, else 'default') and keep it on the member with "
+        "headroom. CLAUDE_POOL_TOKENS_<NAME> defines the pool from the "
+        "environment. cswap's own output goes to stderr, so this can stand in "
         "for the claude binary in wrappers.",
     )
     parser.add_argument(
@@ -202,7 +206,7 @@ Examples:
             if args.account is not None:
                 parser.error("pass either NUM|EMAIL or --pool, not both")
             with contextlib.redirect_stdout(sys.stderr):
-                manager.run_pool(args.pool, tail)
+                manager.run_pool(args.pool or None, tail)
             return  # only reachable in tests
 
         if args.account is not None:
@@ -605,7 +609,9 @@ def _pool_command(argv: list[str]) -> None:
 Examples:
   cswap pool cvp 2 3                  # add accounts 2 and 3 to pool 'cvp'
   cswap pool cvp 3 --remove           # take account 3 out
-  cswap pool                          # list pools
+  cswap pool                          # list pools (* = the member it is on)
+  cswap pool cvp --switch             # move running sessions to the best member
+  cswap pool cvp 4 --switch           # ... or to account 4
   cswap run --pool cvp                # launch the best member
         """,
     )
@@ -614,14 +620,25 @@ Examples:
         "accounts", nargs="*", metavar="NUM|EMAIL", help="Accounts to add or remove"
     )
     parser.add_argument("--remove", action="store_true", help="Remove the accounts")
+    parser.add_argument(
+        "--switch",
+        action="store_true",
+        help="Point the pool's profile (and its running sessions) at this "
+        "member, or the one with the most headroom",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
-    if args.name is not None and not args.accounts:
+    if args.switch:
+        if args.name is None or args.remove or len(args.accounts) > 1:
+            parser.error("--switch takes a pool NAME and at most one NUM|EMAIL")
+    elif args.name is not None and not args.accounts:
         parser.error("at least one NUM|EMAIL is required")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
+
+        from claude_swap import pools as _pools
 
         if args.name is None:
             pools = switcher.pools()
@@ -631,8 +648,32 @@ Examples:
             accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
             for name, nums in pools.items():
                 print(bolded(f"{name}:"))
+                profile = _pools.profile_dir(switcher.backup_dir, name)
+                on = _pools.current_member(switcher, profile, nums)
                 for num in nums:
-                    print(f"  {num}: {muted(accounts[num].get('email', ''))}")
+                    mark = "*" if num == on else " "
+                    print(f" {mark}{num}: {muted(accounts[num].get('email', ''))}")
+            return
+
+        if args.switch:
+            name = _pools.normalize_pool(args.name)
+            if args.accounts:
+                target = switcher.resolve_account(args.accounts[0])[0]
+                if target not in switcher.pool_setup_token_members(name):
+                    raise ValidationError(
+                        f"Account-{target} is not a setup-token member of pool '{name}'"
+                    )
+            else:
+                members = switcher.pool_setup_token_members(name)
+                if not members:
+                    raise ConfigError(f"Pool '{name}' has no setup-token members")
+                target = _pools.best_member(switcher.pool_headroom(members))
+            _, email, _ = switcher.resolve_account(target)
+            _pools.write_profile_credentials(
+                _pools.profile_dir(switcher.backup_dir, name),
+                switcher.read_account_credentials(target, email),
+            )
+            print(f"{accent('Switched')} pool '{name}' to Account-{target} ({email})")
             return
 
         nums = switcher.set_pool_membership(
@@ -751,11 +792,29 @@ Defaults live in settings.json in the backup root; flags override them.
         help="Evaluate and report, but never switch or write state",
     )
     parser.add_argument(
+        "--pool",
+        metavar="NAME",
+        help=(
+            "Switch this pool's profile (what `cswap run --pool` launches) "
+            "instead of the default login. Every pool launch runs one itself"
+        ),
+    )
+    parser.add_argument(
+        "--pid",
+        type=int,
+        metavar="PID",
+        help="With --pool: exit when this process does",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args(argv)
+    if args.pool is None and args.pid is not None:
+        parser.error("--pid needs --pool")
+    if args.pool is not None and (args.strategy or args.include_api_key_accounts):
+        parser.error("--strategy and --include-api-key-accounts do not apply to --pool")
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
@@ -783,6 +842,8 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        if args.pool is not None:
+            sys.exit(_auto_pool(switcher, args, settings))
         engine = AutoSwitchEngine(
             switcher,
             settings,
@@ -816,6 +877,42 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+
+
+def _auto_pool(switcher: ClaudeAccountSwitcher, args, settings) -> int:
+    """`cswap auto --pool NAME`: the pool profile's watcher (see pools.py)."""
+    import time as _time
+
+    from claude_swap import pools
+    from claude_swap.printer import yellowed
+
+    name = pools.normalize_pool(args.pool)
+
+    def emit(event: dict) -> None:
+        event = {"ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"), "pool": name, **event}
+        if args.json:
+            print(json.dumps(event), flush=True)
+            return
+        kind = event["event"]
+        if kind == "switch":
+            line = accent(f"Switched pool '{name}': Account-{event['from']} -> Account-{event['to']}")
+        elif kind == "poll":
+            rows = ", ".join(
+                f"{n}{'*' if n == event['current'] else ''}: "
+                + ("?" if h is None else f"{100 - h:.0f}% used")
+                for n, h in event["headroom"].items()
+            )
+            line = dimmed(f"pool '{name}' {rows}")
+        else:
+            line = yellowed(event.get("message", kind))
+        print(f"{_time.strftime('%H:%M:%S')}  {line}", flush=True)
+
+    watcher = pools.PoolWatcher(switcher, name, settings, emit, dry_run=args.dry_run)
+    if not args.once:
+        import signal
+
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    return watcher.run(args.pid, once=args.once)
 
 
 def _config_command(argv: list[str]) -> None:
@@ -1046,10 +1143,29 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _claude_shim(argv: list[str]) -> None:
+    """cswap installed as ``claude`` (``ln -s "$(command -v cswap)" ~/bin/claude``
+    ahead of the real one on PATH): every launch is ``cswap run --pool --``.
+
+    The shim's directory leaves PATH, so cswap — its usage probes included —
+    and everything claude starts find the real claude, not the shim.
+    """
+    me = os.path.realpath(sys.argv[0])
+    path = [
+        d for d in os.environ.get("PATH", "").split(os.pathsep)
+        if os.path.realpath(os.path.join(d or ".", "claude")) != me
+    ]
+    os.environ["PATH"] = os.pathsep.join(path)
+    _run_command(["--pool", "--", *argv])
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     _use_native_tls()
+    if os.path.basename(sys.argv[0]) == "claude":
+        _claude_shim(sys.argv[1:])
+        return
     argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
@@ -1123,8 +1239,9 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
-  %(prog)s run --pool <name> [-- ...] run the best account in a pool
+  %(prog)s run --pool [name] [-- ...] run a pool, kept on a member with headroom
   %(prog)s pool <name> <num|email>... add accounts to a pool (--remove)
+  %(prog)s pool <name> --switch       move a pool's sessions to its best member
   %(prog)s pool                       list pools
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings

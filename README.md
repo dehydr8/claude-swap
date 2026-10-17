@@ -164,16 +164,19 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 ### Pools — launch the best of a group of accounts
 
-Group accounts (say, the ones approved for a particular kind of work) into a named pool, and `cswap run --pool` launches whichever member has the most headroom right now:
+Group accounts (say, the ones approved for a particular kind of work) into a named pool, and `cswap run --pool` launches a member with headroom and keeps it on one:
 
 ```bash
 cswap pool cvp 2 3              # add accounts 2 and 3 to pool 'cvp' (an account can be in several pools)
 cswap pool cvp 3 --remove       # take one out
-cswap pool                      # list pools
+cswap pool                      # list pools (* marks the member each is on)
 cswap run --pool cvp -- --resume
+cswap pool cvp --switch         # move running sessions to the best member now (or: cswap pool cvp 3 --switch)
 ```
 
-Setup-token members run on your normal `~/.claude` with the token passed in `CLAUDE_CODE_OAUTH_TOKEN` (no session profile; their tokens never rotate, so any number of concurrent launches can share one). Other members launch in session mode with history shared, so a resume works whichever member a later launch picks. To keep pool members for pool launches only, `cswap disable` them: disabled accounts stay out of `cswap auto` and default-login rotation but are still picked by `--pool` (to rest one, remove it from the pool). cswap's own output goes to stderr, so `cswap run --pool NAME --` can stand in for the `claude` binary in tools that drive it over stdout.
+Setup-token members run in the pool's own config dir (`<backup root>/pools/<name>/`), with settings, skills and history linked from `~/.claude`, so a resume works whichever member a session ran on. That dir's `.credentials.json` holds the member the pool is on, and a running Claude Code re-reads it before its next request: each launch starts `cswap auto --pool NAME` beside claude, which moves the pool to another member when the current one reaches the auto-switch threshold (the same `autoswitch.*` settings as `cswap auto`; log in `pools/<name>.log`), and exits with claude. A launch stays on the member the pool is on unless another has clearly more headroom. Setup tokens never rotate, so any number of concurrent launches share the pool. Other members launch in session mode with history shared (no mid-session moves).
+
+The default login is never touched, so `cswap auto` can keep rotating your other accounts while pools rotate theirs. To keep pool members for pool launches only, `cswap disable` them: disabled accounts stay out of `cswap auto` and default-login rotation but are still picked by `--pool` (to rest one, remove it from the pool). cswap's own output goes to stderr, so `cswap run --pool NAME --` can stand in for the `claude` binary in tools that drive it over stdout.
 
 <details>
 <summary>Use a pool as a Paseo provider</summary>
@@ -190,7 +193,21 @@ In `~/.paseo/config.json`, a Claude provider whose `command` is the pool launche
 } }
 ```
 
-Every agent launch (and every relaunch, e.g. after a model change) picks the pool member with the most headroom at that moment.
+</details>
+
+<details>
+<summary>Pools from environment variables (sandboxes, Amp orbs)</summary>
+
+Where accounts arrive as secrets in the environment, no setup step is needed:
+
+- `CLAUDE_POOL_TOKENS_<NAME>` lists a pool's setup tokens, separated by spaces, commas, or newlines, each optionally written `name:token` (names become aliases). Every `cswap run --pool NAME` registers new tokens, updates changed ones, and removes accounts it registered that the list dropped; accounts you added by hand are left alone. No `CLAUDE_POOL_TOKENS_*` variable reaches claude.
+- `CLAUDE_POOL` names the pool when `--pool` has no NAME; otherwise it is `default`. With neither set and no `default` pool, `cswap run --pool` launches plain claude on the default login. A pool named by `CLAUDE_POOL` that has no members is an error.
+- Invoked as `claude`, cswap behaves as `cswap run --pool --` and runs the real `claude` from further down `PATH`. So a symlink ahead of it on `PATH` turns every launch into a pool launch:
+
+```bash
+uv tool install claude-swap
+mkdir -p ~/bin && ln -sf "$(command -v cswap)" ~/bin/claude   # ~/bin before the real claude on PATH
+```
 
 </details>
 
@@ -214,7 +231,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
-cswap run --pool cvp            # Run the best account in a pool (see Pools)
+cswap run --pool cvp            # Run a pool, kept on a member with headroom (see Pools)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
@@ -410,11 +427,13 @@ setup-token. It switches like any other account; since API keys have no subscrip
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
 
-**Setup-token usage.** The usage endpoint never answers a setup-token, so cswap reads
-its 5h/7d usage from one minimal `claude -p` turn instead (Haiku, no tools, a
-throwaway config dir; a few hundred tokens of the account's own quota), on the same
-cadence as any other usage poll. This needs `claude` on `PATH`. Per-model windows and
-extra-usage spend are not reported this way.
+**Setup-token usage.** The usage endpoint never answers an inference-only token (what
+`claude setup-token` issues), so cswap reads its 5h/7d usage from one minimal `claude -p`
+turn instead (Haiku, no tools, a throwaway config dir; a few hundred tokens of the
+account's own quota), on the same cadence as any other usage poll. This needs `claude`
+on `PATH`. Per-model windows and extra-usage spend are not reported this way. The token
+string does not say its scopes, so cswap asks the profile endpoint once per token: one
+that also has `user:profile` gets the normal usage endpoint instead.
 
 ## Uninstall
 

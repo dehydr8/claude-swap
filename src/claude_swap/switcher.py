@@ -1093,17 +1093,13 @@ class ClaudeAccountSwitcher:
                 out.setdefault(name, []).append(str(num))
         return dict(sorted(out.items()))
 
-    def pick_pool_account(self, pool: str, rank: bool = True) -> str:
-        """The pool member with the most headroom right now (``rank=False``:
-        the first usable member, without touching usage).
+    def pool_members(self, pool: str) -> list[str]:
+        """A pool's usable members, in sequence order.
 
-        Disabled members are still picked: ``disable`` keeps an account off
-        the default login's rotation, and a pool launch never touches the
-        default login — so ``cswap disable`` reserves a member for its pools.
-        To rest a member, remove it from the pool. Members whose usage is
-        unknown rank below every measured one; ties keep sequence order. An
-        exhausted pool still returns its best member — Claude Code reports the
-        limit itself, which beats refusing to launch.
+        Disabled members count: ``disable`` keeps an account off the default
+        login's rotation, and a pool launch never touches the default login
+        — so ``cswap disable`` reserves a member for its pools. To rest a
+        member, remove it from the pool.
         """
         name = pool.strip().lower()
         members = self.pools().get(name)
@@ -1112,15 +1108,53 @@ class ClaudeAccountSwitcher:
         candidates = [n for n in members if self._account_is_switchable(n)]
         if not candidates:
             raise ConfigError(f"Pool '{name}' has no usable accounts")
+        return candidates
+
+    def pool_setup_token_members(self, pool: str) -> list[str]:
+        """The members a pool profile can hold (see ``claude_swap.pools``)."""
+        out = []
+        for num in self.pool_members(pool):
+            _, email, _ = self.resolve_account(num)
+            creds = self.read_account_credentials(num, email)
+            if creds and oauth.is_setup_token(oauth.extract_oauth_data(creds)):
+                out.append(num)
+        return out
+
+    def pool_usage(
+        self, members: list[str], fetch: set[str] | None = None, *, scheduled: bool = False
+    ) -> dict[str, dict | str | None]:
+        """Decision-grade usage for these accounts only: a pool launch must not
+        spend usage probes on accounts outside the pool."""
+        wanted = set(members)
+        info = [i for i in self._build_accounts_info() if str(i[0]) in wanted]
+        entries = self._collect_usage_entries(info, fetch=fetch, scheduled=scheduled)
+        return {num: entry.decision_value() for num, entry in entries.items()}
+
+    def pool_headroom(
+        self, members: list[str], fetch: set[str] | None = None, *, scheduled: bool = False
+    ) -> dict[str, float | None]:
+        """Headroom per member, in the given order (see ``pools.headroom_by_member``)."""
+        from claude_swap import pools as _pools
+
+        _threshold, models = self._poll_policy_inputs()
+        usage = self.pool_usage(members, fetch, scheduled=scheduled)
+        headroom = _pools.headroom_by_member(usage, models)
+        return {n: headroom.get(n) for n in members}
+
+    def pick_pool_account(self, pool: str, rank: bool = True) -> str:
+        """The pool member with the most headroom right now (``rank=False``:
+        the first usable member, without touching usage).
+
+        Members whose usage is unknown rank below every measured one; ties
+        keep sequence order. An exhausted pool still returns its best member
+        — Claude Code reports the limit itself, which beats refusing to launch.
+        """
+        from claude_swap import pools as _pools
+
+        candidates = self.pool_members(pool)
         if not rank:
             return candidates[0]
-        _threshold, models = self._poll_policy_inputs()
-        usage = self._usage_by_account()
-        headroom = {n: oauth.account_headroom(usage.get(n), models) for n in candidates}
-        return max(
-            candidates,
-            key=lambda n: (headroom[n] is not None, headroom[n] or 0.0),
-        )
+        return _pools.best_member(self.pool_headroom(candidates))
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
